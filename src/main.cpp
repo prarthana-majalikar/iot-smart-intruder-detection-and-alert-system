@@ -18,7 +18,7 @@
 #include <Adafruit_Sensor.h>
 
 // ---- USER WIFI + AUTH ----
-#include "nvs.h" // ESP NVS (non-volatile storage) APIs
+#include "nvs.h" // ESP NVS APIs
 #include "nvs_flash.h"
 
 // ------------ USER CONFIG--------------
@@ -26,20 +26,20 @@ char ssid[50];
 char pass[50];
 // ---------------------------
 
-// Pin assignments (match wiring!)
 #define LED_PIN 2     // LED + resistor
 #define LIGHT_PIN 34  // Junction node of 10k + TEMT6000
-#define BUZZER_PIN 25 // Buzzer +
+#define BUZZER_PIN 25 // Buzzer
 #define SDA_PIN 21    // I2C SDA to LSM6DSO
 #define SCL_PIN 22    // I2C SCL to LSM6DSO
 
 // Blynk Virtual Pins
 #define VPIN_ALERT V0  // String alerts
 #define VPIN_STATUS V1 // 0 = offline, 1 = online
+#define VPIN_ALARM V2  // Alarm switch (0/1)
 
 LSM6DSO imu;
 
-// Motion thresholds in g (SparkFun LSM6DSO returns g units)
+// Motion thresholds in g
 float ACCEL_LOW = 0.05;  // <0.05 g: tiny noise / pet
 float ACCEL_MED = 0.15;  // 0.05–0.15 g: medium motion
 float ACCEL_HIGH = 0.30; // >0.15–0.30 g: strong motion
@@ -52,6 +52,15 @@ int LIGHT_DELTA = 400; // significant change
 bool online = false;
 String eventBuffer[20];
 int bufferCount = 0;
+
+// ----  alarm state ----
+volatile bool alarmActive = false; // true = buzzer+LED keep running until user turns off
+unsigned long lastSirenToggle = 0; // timing for non-blocking siren
+bool sirenOn = false;
+
+//  prevent spamming alerts every 50ms while alarm is already active
+unsigned long lastIntruderMsgMs = 0;
+const unsigned long INTRUDER_MSG_COOLDOWN_MS = 2000; // send message at most every 2s while alarm active
 
 // Periodic status update to Blynk (even in standby)
 const unsigned long STATUS_INTERVAL_MS = 1000; // 1 second
@@ -137,22 +146,20 @@ void sendAlert(const String &msg)
 {
     Serial.println(msg);
 
-    // Simple visual + audible alert: 3 quick beeps/blinks
-    for (int i = 0; i < 3; i++)
-    {
-        digitalWrite(LED_PIN, HIGH);
-        tone(BUZZER_PIN, 1500, 150); // 1.5 kHz tone, 150 ms
-        delay(200);
-        digitalWrite(LED_PIN, LOW);
-        delay(100);
-    }
+    // Start continuous alarm
+    alarmActive = true;
+    sirenOn = false; // reset siren state so it starts cleanly
+    lastSirenToggle = 0;
 
+    // Turn ON the alarm switch in Blynk UI
     if (online && Blynk.connected())
     {
+        Blynk.virtualWrite(VPIN_ALARM, 1);
         Blynk.virtualWrite(VPIN_ALERT, msg);
     }
     else
     {
+        // If offline, buffer the message; alarm still rings locally
         bufferEvent(msg);
     }
 }
@@ -177,16 +184,64 @@ void reconnectCheck()
     {
         if (!online)
         {
-            // We just came back online
+            // just came back online
             flushBuffer();
         }
         online = true;
         Blynk.virtualWrite(VPIN_STATUS, 1);
+        Blynk.virtualWrite(VPIN_ALARM, alarmActive ? 1 : 0);
     }
     else
     {
         online = false;
         Blynk.virtualWrite(VPIN_STATUS, 0);
+    }
+}
+
+BLYNK_WRITE(VPIN_ALARM)
+{
+    int v = param.asInt(); // 0 or 1 from switch
+    alarmActive = (v == 1);
+
+    if (!alarmActive)
+    {
+        // User acknowledged / false alarm -> stop everything immediately
+        noTone(BUZZER_PIN);
+        digitalWrite(LED_PIN, LOW);
+        sirenOn = false;
+
+        // log in app
+        if (Blynk.connected())
+        {
+            Blynk.virtualWrite(VPIN_ALERT, "Alarm cleared by user (switch OFF).");
+        }
+    }
+}
+
+void runSiren()
+{
+    if (!alarmActive)
+        return;
+
+    // Toggle buzzer/LED every 250ms
+    const unsigned long SIREN_PERIOD_MS = 250;
+    unsigned long now = millis();
+
+    if (now - lastSirenToggle >= SIREN_PERIOD_MS)
+    {
+        lastSirenToggle = now;
+        sirenOn = !sirenOn;
+
+        if (sirenOn)
+        {
+            digitalWrite(LED_PIN, HIGH);
+            tone(BUZZER_PIN, 1500);
+        }
+        else
+        {
+            digitalWrite(LED_PIN, LOW);
+            noTone(BUZZER_PIN);
+        }
     }
 }
 
@@ -205,7 +260,7 @@ void setup()
     Wire.begin(SDA_PIN, SCL_PIN);
 
     if (!imu.begin())
-    { // uses I2C, default addr 0x6B
+    {
         Serial.println("Failed to find LSM6DSO chip");
         while (1)
         {
@@ -251,6 +306,7 @@ void loop()
     }
 
     reconnectCheck();
+    runSiren();
 
     // ---- Read IMU ----
     float ax = imu.readFloatAccelX();
@@ -258,8 +314,8 @@ void loop()
     float az = imu.readFloatAccelZ();
 
     // Total acceleration magnitude and delta from 1g
-    float mag = sqrt(ax * ax + ay * ay + az * az); // in g
-    float delta = fabs(mag - 1.0f);                // 1.0 g baseline
+    float mag = sqrt(ax * ax + ay * ay + az * az);
+    float delta = fabs(mag - 1.0f); // 1.0 g baseline
     // ---- Read light sensor ----
     int light = analogRead(LIGHT_PIN);
     int Ldelta = abs(light - LIGHT_BASE);
@@ -305,7 +361,7 @@ void loop()
     }
 
     // ---- Periodic status updates in standby ----
-    if (!intruder && online && Blynk.connected())
+    if (!intruder && !alarmActive && online && Blynk.connected())
     {
         unsigned long now = millis();
         if (now - lastStatusSend >= STATUS_INTERVAL_MS)
@@ -321,10 +377,31 @@ void loop()
         }
     }
 
-    if (intruder)
+    if (intruder || alarmActive)
     {
-        String msg = "INTRUSION DETECTED | dAccel=" + String(delta, 2) + " | light=" + String(light) + " | dLight=" + String(Ldelta);
-        sendAlert(msg);
+        unsigned long now = millis();
+
+        // If alarm not already active -> trigger it immediately
+        if (!alarmActive)
+        {
+            String msg = "INTRUSION DETECTED | dAccel=" + String(delta, 2) +
+                         " | light=" + String(light) +
+                         " | dLight=" + String(Ldelta);
+            sendAlert(msg);
+            lastIntruderMsgMs = now;
+        }
+        else
+        {
+            // Alarm is already ringing: optionally refresh the text only every few seconds
+            if (online && Blynk.connected() && (now - lastIntruderMsgMs >= INTRUDER_MSG_COOLDOWN_MS))
+            {
+                lastIntruderMsgMs = now;
+                String msg = "INTRUSION (ALARM ON) | dAccel=" + String(delta, 2) +
+                             " | light=" + String(light) +
+                             " | dLight=" + String(Ldelta);
+                Blynk.virtualWrite(VPIN_ALERT, msg);
+            }
+        }
     }
 
     delay(50); // ~20 Hz loop
