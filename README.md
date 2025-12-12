@@ -43,7 +43,7 @@ The system follows a layered IoT architecture:
 
 ### Software
 - C++ 
-- Arduino / PlatformIO
+- PlatformIO
 
 ### Protocols & Tools
 - Wi-Fi
